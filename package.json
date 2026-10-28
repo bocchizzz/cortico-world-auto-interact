@@ -30,7 +30,11 @@
     "api": 6,
     "displayName": "自动互动",
     "icon": "icon.png",
-    "tags": [],
+    "tags": [
+      "companion",
+      "experimental",
+      "sensitive-data"
+    ],
     "describe": "describe.json",
     "webUiClient": "dist/webui.js",
     "webUiStyle": "dist/webui.css",
