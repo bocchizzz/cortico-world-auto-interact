@@ -1,0 +1,71 @@
+{
+  "name": "cortico-world-auto-interact",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Cortico World: probability-checked check-ins that let the desktop pet speak up with screen and system context",
+  "license": "MIT",
+  "author": "bocchizzz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bocchizzz/cortico-world-auto-interact.git"
+  },
+  "homepage": "https://github.com/bocchizzz/cortico-world-auto-interact",
+  "bugs": {
+    "url": "https://github.com/bocchizzz/cortico-world-auto-interact/issues"
+  },
+  "keywords": [
+    "cortico-world",
+    "cortico"
+  ],
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.28.6",
+  "main": "./src/index.ts",
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "displayName": "自动互动",
+    "icon": "icon.png",
+    "tags": [],
+    "describe": "describe.json",
+    "webUiClient": "dist/webui.js",
+    "webUiStyle": "dist/webui.css",
+    "locales": {
+      "zh": {
+        "displayName": "自动互动",
+        "description": "按设定频率把 Coo 叫醒，看一眼屏幕再开口；没命中就不打扰。"
+      },
+      "en": {
+        "displayName": "Auto Interact",
+        "description": "Wakes the pet on a probability-checked schedule, looks at the screen, and speaks up."
+      }
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "icon.png",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "describe.json"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.webui.json --noEmit",
+    "build:webui": "esbuild src/webui/client.ts --bundle --format=esm --platform=browser --outdir=dist --entry-names=webui --minify",
+    "describe:extension": "node --import tsx scripts/write-describe.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "cortico": "^0.2.8",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
