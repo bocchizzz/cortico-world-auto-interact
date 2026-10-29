@@ -32,7 +32,6 @@
     "icon": "icon.png",
     "tags": [
       "companion",
-      "experimental",
       "sensitive-data"
     ],
     "describe": "describe.json",

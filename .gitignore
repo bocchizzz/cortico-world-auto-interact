@@ -4,3 +4,11 @@ node_modules/
 .pnpm-cache/
 .scratch/
 .npmrc
+
+# 本地运行数据与凭据，不应进仓库
+auto-interact-records.json
+/config.json
+.env
+.env.*
+*.pem
+*.key
