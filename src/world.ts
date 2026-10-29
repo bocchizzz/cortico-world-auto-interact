@@ -178,6 +178,11 @@ function formatSpan(ms: number): string {
   return restHours === 0 ? `${days} 天` : `${days} 天 ${restHours} 小时`;
 }
 
+/** 倍率给人看：最多两位小数，去掉末尾的零。 */
+function formatFactor(value: number): string {
+  return String(Number(value.toFixed(2)));
+}
+
 function formatGb(mb: number): string {
   return (mb / 1024).toFixed(1);
 }
@@ -229,6 +234,8 @@ export class AutoInteractWorld implements World {
   private paceUntilMs = 0;
   /** 这一轮调过的工具（本轮结束后清空）与本轮开始时刻。 */
   private readonly turnTools = new Set<string>();
+  /** 工具名对应的补充说明，比如截图没成、调速后的倍率。 */
+  private readonly turnToolNotes = new Map<string, string>();
   private turnStartedAt: number | null = null;
   private readonly state: NudgeState = {
     lastNudgeAtMs: null,
@@ -398,21 +405,25 @@ export class AutoInteractWorld implements World {
     this.awaitingNudge = true;
     this.sawSpeech = false;
     this.turnTools.clear();
+    this.turnToolNotes.clear();
     this.turnStartedAt = this.clock();
   }
 
-  /** 一轮结束：这一轮没调 `pet_say` / `pet_ask` 就算没开口，工具与耗时一并记下。 */
+  /** 一轮结束：这一轮没调 `pet_say` / `pet_ask` 就算没开口，工具、说明与耗时一并记下。 */
   onTurnEnded(): void {
     if (!this.awaitingNudge) return;
     const startedAt = this.turnStartedAt;
+    const ms = startedAt === null ? undefined : Math.max(0, this.clock() - startedAt);
     this.finishOutcome(
       this.sawSpeech ? 'spoke' : 'silent',
       [...this.turnTools],
-      startedAt === null ? undefined : Math.max(0, this.clock() - startedAt),
+      ms,
+      this.turnToolNotes.size > 0 ? Object.fromEntries(this.turnToolNotes) : undefined,
     );
     this.awaitingNudge = false;
     this.turnStartedAt = null;
     this.turnTools.clear();
+    this.turnToolNotes.clear();
   }
 
   /** 判断用到的条件；配置热改后每次现算。 */
@@ -553,18 +564,26 @@ export class AutoInteractWorld implements World {
   private async lookTool(): Promise<ToolOutcome> {
     const cfg = this.cfg;
     if (!cfg.allowScreenshot) {
+      this.noteTool('auto_look', '没看屏幕（截图已关闭）');
       return {
         text: '截图已关闭，这里拿不到画面。要让这个工具可用，需要在 World 页打开「允许截图」。',
         failed: true,
       };
     }
     const shot = await this.probe.capture({ maxWidth: cfg.screenshotMaxWidth, quality: cfg.screenshotQuality });
-    if (!shot.ok) return { text: `截图失败：${shot.error}`, failed: true };
+    if (!shot.ok) {
+      this.noteTool('auto_look', '没看屏幕（截图失败）');
+      return { text: `截图失败：${shot.error}`, failed: true };
+    }
     const value = shot.value;
     const head = `截屏 ${value.width}×${value.height}，原图 ${value.sourceWidth}×${value.sourceHeight}，`
       + `${Math.max(1, Math.round(value.bytes.byteLength / 1024))} KB。`;
     const accepts = this.host?.modelFacts.accepts('image/jpeg') ?? false;
-    if (!accepts) return { text: `${head}\n当前模型端点不接受图片，只有这段文字。` };
+    if (!accepts) {
+      this.noteTool('auto_look', '截了图，但当前模型不收图');
+      return { text: `${head}\n当前模型端点不接受图片，只有这段文字。` };
+    }
+    this.noteTool('auto_look', '看了屏幕');
     return {
       text: head,
       blobs: [{
@@ -635,8 +654,11 @@ export class AutoInteractWorld implements World {
     this.paceFactor = factor;
     this.paceUntilMs = nowMs + minutes * MINUTE_MS;
     const probability = this.probability(nowMs);
-    return `接下来 ${minutes} 分钟按 ${factor} 倍调速，到 ${formatClock(this.paceUntilMs, this.timezone)} 恢复；`
-      + `命中概率现在 ${Math.round(probability * 100)}%，平均 ${Math.max(1, Math.round(5 / probability))} 分钟叫醒一次。`;
+    const between = Math.max(1, Math.round(BASE_INTERVAL_MS / MINUTE_MS / probability));
+    const until = formatClock(this.paceUntilMs, this.timezone);
+    this.noteTool('auto_pace', `${formatFactor(factor)} 倍，约每 ${between} 分钟一次，到 ${until} 恢复`);
+    return `接下来 ${minutes} 分钟按 ${factor} 倍调速，到 ${until} 恢复；`
+      + `命中概率现在 ${Math.round(probability * 100)}%，平均 ${between} 分钟叫醒一次。`;
   }
 
   private async pushQuietEvent(host: WorldHost, untilMs: number | null): Promise<void> {    const text = untilMs === null
@@ -655,13 +677,16 @@ export class AutoInteractWorld implements World {
     );
   }
 
-  /** 事件库里最近一条用户消息；只看 24 小时内，按 `console.message` 或外部来源识别。 */
+  /** 事件库里最近一条用户发言；只看 24 小时内，类型由 `latestUserEventAt` 判定。 */
   private findLastUserMessageAt(host: WorldHost, nowMs: number): number | null {
     try {
       const since = new Date(nowMs - 24 * 60 * MINUTE_MS).toISOString();
-      const events = host.store.range({ fromTs: since, limit: 200 });
       let latest: number | null = null;
-      for (const event of events) latest = latestUserEventAt(event, latest);
+      // 分来源查，免得桌宠或别的 World 的高频事件把真正的发言挤出最近 200 条。
+      for (const source of USER_SPEECH_SOURCES) {
+        const events = host.store.range({ source, fromTs: since, limit: 200 });
+        for (const event of events) latest = latestUserEventAt(event, latest);
+      }
       return latest;
     } catch (error) {
       host.log.debug('读事件库失败，跳过「用户刚说过话」这项判断', { error });
@@ -694,13 +719,25 @@ export class AutoInteractWorld implements World {
     this.persist();
   }
 
+  /** 记下这一轮某个工具的补充说明；不在邀约轮次里就不记。 */
+  private noteTool(name: string, note: string): void {
+    if (!this.awaitingNudge) return;
+    this.turnToolNotes.set(name, note);
+  }
+
   /** 把最近一条还没回应的邀约改成就绪的结果，并结算今天的开口次数。 */
-  private finishOutcome(outcome: InteractionOutcome, tools?: string[], ms?: number): void {
+  private finishOutcome(
+    outcome: InteractionOutcome,
+    tools?: string[],
+    ms?: number,
+    toolNotes?: Record<string, string>,
+  ): void {
     for (let index = this.records.length - 1; index >= 0; index -= 1) {
       const record = this.records[index];
       if (record.kind === 'nudge' && record.outcome === 'pending') {
         record.outcome = outcome;
         if (tools?.length) record.tools = tools;
+        if (toolNotes && Object.keys(toolNotes).length > 0) record.toolNotes = toolNotes;
         if (ms !== undefined) record.ms = ms;
         if (outcome === 'spoke') {
           this.state.todaySpoken += 1;
@@ -745,14 +782,17 @@ export class AutoInteractWorld implements World {
   }
 }
 
-/** 这一轮用过的工具翻成一句人话，并带上耗时。 */
+/** 这一轮用过的工具翻成一句人话，并带上这一轮的说明与耗时。 */
 function turnDetail(record: InteractionRecord): string {
   const parts: string[] = [];
   const tools = record.tools ?? [];
-  if (tools.includes('auto_look')) parts.push('看了屏幕');
+  const notes = record.toolNotes ?? {};
+  if (tools.includes('auto_look')) parts.push(notes.auto_look ?? '调用过截图');
   if (tools.includes('auto_status')) parts.push('看了状态');
   if (tools.includes('auto_quiet')) parts.push('设了安静');
-  if (tools.includes('auto_pace')) parts.push('调了频率');
+  if (tools.includes('auto_pace')) {
+    parts.push(notes.auto_pace ? `调了频率：${notes.auto_pace}` : '调了频率');
+  }
   if (tools.includes('pet_ask')) parts.push('问了你');
   if (record.ms !== undefined && record.ms > 0) {
     parts.push(`${Math.max(1, Math.round(record.ms / 1000))} 秒`);
@@ -771,10 +811,25 @@ function functionCallName(event: { type: string; item?: unknown }): string | nul
   return item.name;
 }
 
-/** 用户消息的判定：我们自己的事件不算，`console.message` 和外部来源算。 */
+/**
+ * 用户发言的事件类型。
+ * 不能只看 `origin === 'external'`：World 推的事件默认就是 external，桌宠自己的
+ * `desktop-pet.self`、生态箱公告等都会落库，把它们当成用户刚说过话会误挡下一轮。
+ */
+const USER_SPEECH_TYPES: ReadonlySet<string> = new Set([
+  'console.message',
+  'desktop-pet.message',
+  'desktop-pet.speech',
+  'desktop-pet.answer',
+]);
+
+/** 上面这些事件可能出现的 World；按来源查，避免被别的高频事件挤掉。 */
+const USER_SPEECH_SOURCES: readonly string[] = ['console', 'desktop-pet'];
+
+/** 用户消息的判定：只认真正由使用者打字、说话或作答的事件。 */
 function latestUserEventAt(event: EventEnvelope, latest: number | null): number | null {
   if (event.source === WORLD_ID) return latest;
-  if (event.type !== 'console.message' && event.origin !== 'external') return latest;
+  if (!USER_SPEECH_TYPES.has(event.type)) return latest;
   const at = Date.parse(event.ts);
   if (Number.isNaN(at)) return latest;
   return latest === null || at > latest ? at : latest;

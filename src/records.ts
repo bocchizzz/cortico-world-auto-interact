@@ -14,6 +14,8 @@ export interface InteractionRecord {
   pity?: boolean;
   /** 这一轮调过的工具名，用来复盘它到底做了什么。 */
   tools?: string[];
+  /** 工具名对应的补充说明：截图为什么没成、调速后的倍率等。 */
+  toolNotes?: Record<string, string>;
   /** 从叫醒到这一轮结束的毫秒数。 */
   ms?: number;
 }

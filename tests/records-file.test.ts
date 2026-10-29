@@ -26,6 +26,22 @@ describe('记录文件', () => {
     expect(loadRecords(file)).toEqual(rows);
   });
 
+  it('工具的补充说明能原样读回来', () => {
+    const file = recordsPath(dir);
+    const rows: InteractionRecord[] = [{
+      atMs: 1,
+      kind: 'nudge',
+      outcome: 'spoke',
+      tools: ['auto_look', 'auto_pace'],
+      toolNotes: {
+        auto_look: '看了屏幕',
+        auto_pace: '0.5 倍，约每 10 分钟一次，到 10:35 恢复',
+      },
+    }];
+    saveRecords(file, rows);
+    expect(loadRecords(file)).toEqual(rows);
+  });
+
   it('文件不存在或 JSON 坏了都当作没有记录', () => {
     expect(loadRecords(recordsPath(dir))).toEqual([]);
     const file = recordsPath(dir);
@@ -43,6 +59,8 @@ describe('记录文件', () => {
         { atMs: 3, kind: 'skip', reason: 'made-up' },
         { atMs: 4, kind: 'nudge', outcome: 'weird' },
         { atMs: 5, kind: 'nudge' },
+        { atMs: 6, kind: 'nudge', toolNotes: { auto_look: 1 } },
+        { atMs: 7, kind: 'nudge', toolNotes: [] },
       ],
     }), 'utf8');
     expect(loadRecords(file)).toEqual([

@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-auto-interact",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Cortico World: probability-checked check-ins that let the desktop pet speak up with screen and system context",
   "license": "MIT",

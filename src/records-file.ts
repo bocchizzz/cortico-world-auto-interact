@@ -32,6 +32,11 @@ function isRecord(value: unknown): value is InteractionRecord {
     record.tools !== undefined
     && (!Array.isArray(record.tools) || record.tools.some((tool) => typeof tool !== 'string'))
   ) return false;
+  if (record.toolNotes !== undefined) {
+    const notes = record.toolNotes;
+    if (!notes || typeof notes !== 'object' || Array.isArray(notes)) return false;
+    if (Object.entries(notes).some(([name, note]) => !name || typeof note !== 'string')) return false;
+  }
   if (record.kind === 'skip') return isBlockReason(record.reason);
   if (record.kind !== 'nudge') return false;
   return record.outcome === undefined || isOutcome(record.outcome);

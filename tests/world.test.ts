@@ -193,6 +193,72 @@ describe('定时判断', () => {
     await world.stop();
   });
 
+  it.each(['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.answer'])(
+    '%s 算用户说话，挡住下一轮',
+    async (type) => {
+      const { world, host } = setup();
+      host.stored = [{
+        cursor: 1,
+        type,
+        ts: '2026-10-28T10:04:00+08:00',
+        source: 'desktop-pet',
+        origin: 'external',
+        text: '',
+      } as EventEnvelope];
+      await world.start(host);
+      await vi.advanceTimersByTimeAsync(5 * MINUTE);
+      expect(nudges(host)).toHaveLength(0);
+      await world.stop();
+    },
+  );
+
+  it.each([
+    ['desktop-pet.self', 'desktop-pet'],
+    ['desktop-pet.touch', 'desktop-pet'],
+    ['terrarium.announcement', 'terrarium'],
+  ])('%s 不算用户说话，不会挡下一轮', async (type, source) => {
+    const { world, host } = setup();
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(nudges(host)).toHaveLength(1);
+
+    // 桌宠自己的发言、戳一戳、别的 World 的公告都带 origin: external，
+    // 但它们不是用户说的，不能重置「用户说话后等待」。
+    host.stored = [{
+      cursor: 2,
+      type,
+      ts: '2026-10-28T10:05:10+08:00',
+      source,
+      origin: 'external',
+      contextDelivery: type === 'desktop-pet.self' ? 'archive-only' : 'deliver',
+      text: '',
+    } as EventEnvelope];
+
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(nudges(host)).toHaveLength(2);
+    await world.stop();
+  });
+
+  it('用户说话后等够了就恢复', async () => {
+    const { world, host } = setup();
+    host.stored = [{
+      cursor: 1,
+      type: 'desktop-pet.message',
+      ts: '2026-10-28T10:04:00+08:00',
+      source: 'desktop-pet',
+      origin: 'external',
+      text: '',
+    } as EventEnvelope];
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(nudges(host)).toHaveLength(0);
+
+    // 10:15 距 10:04 已超过默认的 8 分钟。
+    await vi.advanceTimersByTimeAsync(10 * MINUTE);
+    expect(nudges(host)).toHaveLength(1);
+    await world.stop();
+  });
+
   it('读空闲时长失败时不搭话也不抛错', async () => {
     const { world, host } = setup({}, { idle: { ok: false, error: 'denied' } });
     await world.start(host);
@@ -392,11 +458,14 @@ describe('互动记录', () => {
   });
 
   it('记下这一轮用过的工具和耗时', async () => {
-    const { world, host } = setup();
+    const { world, host } = setup({ allowScreenshot: true });
     await world.start(host);
+    host.acceptsImage = true;
     await vi.advanceTimersByTimeAsync(5 * MINUTE);
     world.onEventsSettled([nudges(host)[0]], 'delivered');
 
+    await runTool(world, 'auto_look');
+    await runTool(world, 'auto_status');
     const tap = world.outputTap?.();
     tap?.onEvent({ type: 'response.output_item.done', item: { type: 'function_call', name: 'auto_look' } } as never);
     tap?.onEvent({ type: 'response.output_item.done', item: { type: 'function_call', name: 'auto_status' } } as never);
@@ -405,6 +474,66 @@ describe('互动记录', () => {
 
     const { records: rows } = await records(world);
     expect(rows[0].detail).toBe('看了屏幕 · 看了状态 · 8 秒');
+    await world.stop();
+  });
+
+  it('截图关着时记录不写看了屏幕', async () => {
+    const { world, host } = setup();
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    world.onEventsSettled([nudges(host)[0]], 'delivered');
+
+    await runTool(world, 'auto_look');
+    world.outputTap?.()?.onEvent({
+      type: 'response.output_item.done',
+      item: { type: 'function_call', name: 'auto_look' },
+    } as never);
+    world.onTurnEnded();
+
+    const { records: rows } = await records(world);
+    expect(rows[0].detail).toContain('没看屏幕（截图已关闭）');
+    expect(rows[0].detail).not.toContain('看了屏幕');
+    await world.stop();
+  });
+
+  it('截图失败时记录也不写看了屏幕', async () => {
+    const { world, host } = setup(
+      { allowScreenshot: true },
+      { capture: { ok: false, error: '访问被拒绝' } },
+    );
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    world.onEventsSettled([nudges(host)[0]], 'delivered');
+
+    await runTool(world, 'auto_look');
+    world.outputTap?.()?.onEvent({
+      type: 'response.output_item.done',
+      item: { type: 'function_call', name: 'auto_look' },
+    } as never);
+    world.onTurnEnded();
+
+    const { records: rows } = await records(world);
+    expect(rows[0].detail).toContain('没看屏幕（截图失败）');
+    await world.stop();
+  });
+
+  it('调速记录写清调整后的倍率与间隔', async () => {
+    const { world, host } = setup({ allowModelAdjust: true });
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    world.onEventsSettled([nudges(host)[0]], 'delivered');
+
+    await runTool(world, 'auto_pace', { factor: 0.5, minutes: 30 });
+    world.outputTap?.()?.onEvent({
+      type: 'response.output_item.done',
+      item: { type: 'function_call', name: 'auto_pace' },
+    } as never);
+    world.onTurnEnded();
+
+    const { records: rows } = await records(world);
+    expect(rows[0].detail).toContain('调了频率：0.5 倍');
+    expect(rows[0].detail).toContain('约每 10 分钟一次');
+    expect(rows[0].detail).toContain('到 10:35 恢复');
     await world.stop();
   });
 
