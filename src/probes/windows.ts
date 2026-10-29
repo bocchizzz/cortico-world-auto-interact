@@ -3,7 +3,7 @@
  * 全部结果只留在内存里，不写临时文件，不发网络请求。
  * 截图会随模型请求离开本机；调用方负责先确认配置允许。
  */
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 /** 探针结果；失败带一句给人看的原因。 */
 export type Probe<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -45,15 +45,15 @@ export interface CaptureOptions {
   quality: number;
 }
 
-/** World 依赖的探针接口；测试换成假实现。 */
+/** World 依赖的探针接口；测试换成假实现。signal 用来在 World 停止时取消正在跑的进程。 */
 export interface AutoInteractProbe {
-  idleMs(): Promise<Probe<number>>;
-  status(opts: StatusOptions): Promise<Probe<SystemStatus>>;
-  capture(opts: CaptureOptions): Promise<Probe<Screenshot>>;
+  idleMs(signal?: AbortSignal): Promise<Probe<number>>;
+  status(opts: StatusOptions, signal?: AbortSignal): Promise<Probe<SystemStatus>>;
+  capture(opts: CaptureOptions, signal?: AbortSignal): Promise<Probe<Screenshot>>;
 }
 
 /** 一次 PowerShell 调用；返回值是标准输出的原文。 */
-export type PowerShellRunner = (script: string, timeoutMs: number) => Promise<string>;
+export type PowerShellRunner = (script: string, timeoutMs: number, signal?: AbortSignal) => Promise<string>;
 
 const IDLE_SCRIPT = `$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -205,30 +205,99 @@ function firstLine(text: string, limit = 300): string {
   return line.length > limit ? `${line.slice(0, limit)}…` : line;
 }
 
-/** 默认实现：起一个隐藏窗口的 PowerShell 5.1 进程，脚本经 base64 传入，避免转义问题。 */
-const runPowerShell: PowerShellRunner = (script, timeoutMs) => {
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+/**
+ * 默认实现：起一个隐藏窗口的 PowerShell 5.1 进程，脚本作为 `-Command` 的参数传入。
+ * 不用 `-EncodedCommand`，也不加 `-ExecutionPolicy Bypass`：这两个参数最容易触发
+ * 杀毒软件的脚本启发式；`-Command` 直接执行命令文本，不落脚本文件。
+ * 这只能降低误报，不能保证所有安全软件都放行。
+ */
+const runPowerShell: PowerShellRunner = (script, timeoutMs, signal) => {
   return new Promise((resolve, reject) => {
-    execFile(
+    if (signal?.aborted) {
+      reject(new Error('PowerShell 已取消'));
+      return;
+    }
+
+    const child = spawn(
       PS_EXE,
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-      { timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
-      (error, stdout, stderr) => {
-        if (!error) {
-          resolve(String(stdout ?? ''));
-          return;
-        }
-        // stderr 可能是 PowerShell 的 CLIXML 进度噪声，那不是错误原因。
-        const text = String(stderr ?? '').trim();
-        const printable = text && !text.startsWith('#< CLIXML') ? firstLine(text) : '';
-        if (printable) {
-          reject(new Error(printable));
-          return;
-        }
-        const killed = (error as NodeJS.ErrnoException & { killed?: boolean }).killed;
-        reject(new Error(killed ? 'PowerShell 超时未返回' : 'PowerShell 执行失败，没有错误输出'));
-      },
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
     );
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutChars = 0;
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const maxOutputChars = 64 * 1024 * 1024;
+
+    const cleanup = (): void => {
+      if (timeout !== null) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const finish = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+
+    const fail = (message: string): void => {
+      finish(() => reject(new Error(message)));
+    };
+
+    function onAbort(): void {
+      child.kill();
+      fail('PowerShell 已取消');
+    }
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdoutChars += chunk.length;
+      if (stdoutChars > maxOutputChars) {
+        child.kill();
+        fail('PowerShell 输出过大');
+        return;
+      }
+      stdout += chunk;
+    });
+
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.on('error', (error) => {
+      fail(error instanceof Error ? error.message : String(error));
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      if (signal?.aborted) {
+        fail('PowerShell 已取消');
+        return;
+      }
+      if (code === 0) {
+        finish(() => resolve(stdout));
+        return;
+      }
+      // stderr 可能是 PowerShell 的 CLIXML 进度噪声，那不是错误原因。
+      const text = stderr.trim();
+      const printable = text && !text.startsWith('#< CLIXML') ? firstLine(text) : '';
+      fail(printable || 'PowerShell 执行失败，没有错误输出');
+    });
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    timeout = setTimeout(() => {
+      child.kill();
+      fail('PowerShell 超时未返回');
+    }, timeoutMs);
+    (timeout as { unref?: () => void }).unref?.();
   });
 };
 
@@ -283,10 +352,10 @@ export function createWindowsProbe(opts: WindowsProbeOptions = {}): AutoInteract
   const run = opts.run ?? runPowerShell;
 
   return {
-    async idleMs(): Promise<Probe<number>> {
+    async idleMs(signal?: AbortSignal): Promise<Probe<number>> {
       let output: string;
       try {
-        output = await run(IDLE_SCRIPT, 12000);
+        output = await run(IDLE_SCRIPT, 12000, signal);
       } catch (error) {
         return { ok: false, error: errorText(error) };
       }
@@ -299,11 +368,11 @@ export function createWindowsProbe(opts: WindowsProbeOptions = {}): AutoInteract
       return { ok: true, value };
     },
 
-    async status(options: StatusOptions): Promise<Probe<SystemStatus>> {
+    async status(options: StatusOptions, signal?: AbortSignal): Promise<Probe<SystemStatus>> {
       const script = STATUS_SCRIPT.replace('__INCLUDE_WINDOW__', options.includeWindowTitle ? '$true' : '$false');
       let output: string;
       try {
-        output = await run(script, 20000);
+        output = await run(script, 20000, signal);
       } catch (error) {
         return { ok: false, error: errorText(error) };
       }
@@ -340,7 +409,7 @@ export function createWindowsProbe(opts: WindowsProbeOptions = {}): AutoInteract
       };
     },
 
-    async capture(options: CaptureOptions): Promise<Probe<Screenshot>> {
+    async capture(options: CaptureOptions, signal?: AbortSignal): Promise<Probe<Screenshot>> {
       const maxWidth = Math.min(3840, Math.max(320, toInteger(options.maxWidth, 1280)));
       const quality = Math.min(90, Math.max(30, toInteger(options.quality, 70)));
       const script = CAPTURE_SCRIPT
@@ -348,7 +417,7 @@ export function createWindowsProbe(opts: WindowsProbeOptions = {}): AutoInteract
         .replace('__QUALITY__', String(quality));
       let output: string;
       try {
-        output = await run(script, 25000);
+        output = await run(script, 25000, signal);
       } catch (error) {
         return { ok: false, error: errorText(error) };
       }

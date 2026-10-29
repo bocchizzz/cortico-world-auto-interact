@@ -1,6 +1,6 @@
 # cortico-world-auto-interact
 
-<img src="icon.png" width="96" alt="自动互动">
+<img src="icon.png" width="96" alt="主动互动">
 
 Cortico World 扩展：每 5 分钟做一次概率判定，命中就轮到你家的 Coo 开口说一句；未命中就不打扰。
 
@@ -128,7 +128,7 @@ Coopanion 自带的电脑操作（`pet_cua_screenshot`、`pet_cua_windows` 等�
 
 1. 在 Coopanion 的「扩展」页选「手动安装」，选本机目录，填这个包的绝对路径。
 2. 重启 Coopanion 进程。
-3. 在 World 页启用「自动互动」，按需打开「允许截图」「允许模型调速」；截图不需要打开「习惯」页的「电脑操作」，要玩电脑才需要。
+3. 在 World 页启用「主动互动」，按需打开「允许截图」「允许模型调速」；截图不需要打开「习惯」页的「电脑操作」，要玩电脑才需要。
 4. 改代码后重启进程即可生效；卸载在扩展页移除。
 
 包名从 `auto-interact` 改成 `cortico-world-auto-interact` 后，旧的 link 指向不存在的目录，要在扩展页重新装一次。

@@ -139,7 +139,7 @@ export const AUTO_INTERACT_CONFIG_GROUP: ConfigGroup = {
   owner: 'world:auto-interact',
   schema: {
     type: 'object',
-    title: '自动互动',
+    title: '主动互动',
     description: '每 5 分钟做一次判定，命中才把 Coo 叫醒；未命中不会调用模型。',
     properties: {
       'worlds.auto-interact.frequency': {

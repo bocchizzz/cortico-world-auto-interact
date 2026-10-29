@@ -120,18 +120,24 @@ export interface NudgeInput {
   state: NudgeState;
 }
 
+/** 只用内存状态就能判断的部分，不需要探针读数。 */
+export type StaticNudgeInput = Pick<NudgeInput, 'nowMs' | 'zoned' | 'state'>;
+
 /**
- * 依次检查放行条件，全部通过才做概率判定。
- * 顺序固定：越靠前的越常拦下，日志里也更好读。
+ * 先查不依赖探针的条件：安静期、活跃时段、每日上限、用户刚说过话。
+ * 调用方可以先跑这一步，被拦下时就不必再读 PowerShell 或扫事件库。
  */
-export function checkNudge(cfg: RhythmConfig, input: NudgeInput): NudgeDecision {
-  const { nowMs, zoned, idleMs, state } = input;
+export function checkStaticGates(
+  cfg: RhythmConfig,
+  input: StaticNudgeInput,
+  hours: ActiveHours | null = parseActiveHours(cfg.activeHours),
+): NudgeDecision {
+  const { nowMs, zoned, state } = input;
 
   if (state.quietUntilMs !== null && nowMs < state.quietUntilMs) {
     return { allowed: false, reason: 'quiet' };
   }
 
-  const hours = parseActiveHours(cfg.activeHours);
   if (hours && !withinActiveHours(hours, zoned.hour, zoned.minute)) {
     return { allowed: false, reason: 'outside-hours' };
   }
@@ -150,6 +156,19 @@ export function checkNudge(cfg: RhythmConfig, input: NudgeInput): NudgeDecision 
   ) {
     return { allowed: false, reason: 'user-speaking' };
   }
+
+  return { allowed: true };
+}
+
+/**
+ * 依次检查放行条件，全部通过才做概率判定。
+ * 顺序固定：越靠前的越常拦下，日志里也更好读。
+ */
+export function checkNudge(cfg: RhythmConfig, input: NudgeInput): NudgeDecision {
+  const staticDecision = checkStaticGates(cfg, input);
+  if (!staticDecision.allowed) return staticDecision;
+
+  const { idleMs } = input;
 
   // 最短空闲为 0：这一项被关掉，最长空闲跟着失效，用户在与不在都按其余条件判断。
   if (cfg.idleMinMs > 0) {

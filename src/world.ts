@@ -35,6 +35,7 @@ import {
 import { clearRecords, loadRecords, recordsPath, saveRecords } from './records-file.ts';
 import {
   checkNudge,
+  checkStaticGates,
   formatClock,
   localParts,
   parseActiveHours,
@@ -158,13 +159,16 @@ export interface AutoInteractOptions {
 export function rhythmText(cfg: AutoInteractConfigSection): string {
   const level = frequencyLevel(cfg.frequency);
   const percent = Math.round(frequencyProbability(level) * 100);
+  const idle = cfg.idleMinMs > 0
+    ? `用户空闲 ${formatSpan(cfg.idleMinMs)}–${formatSpan(cfg.idleMaxMs)} 时判定`
+    : '不检查用户空闲';
   return `每 5 分钟做一次判定，这一档的命中概率 ${percent}%，平均每 ${frequencyMinutes(level)} 分钟叫你一次；`
-    + `只在本地时间 ${cfg.activeHours} 内、用户空闲 ${formatSpan(cfg.idleMinMs)}–${formatSpan(cfg.idleMaxMs)} 时判定，`
-    + `每天最多成功开口 ${cfg.maxPerDay} 次。`;
+    + `只在本地时间 ${cfg.activeHours} 内、${idle}，每天最多成功开口 ${cfg.maxPerDay} 次。`;
 }
 
 /** 时长给人看：秒、分钟、小时或天。 */
 function formatSpan(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0 秒';
   if (ms < MINUTE_MS) return `${Math.max(1, Math.round(ms / 1000))} 秒`;
   const minutes = Math.round(ms / MINUTE_MS);
   if (minutes < 60) return `${minutes} 分钟`;
@@ -191,16 +195,59 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/** 工具参数里的数字：只接受有限数字或非空数字字符串；null、空串、坏值都算“没给”。 */
+function optionalNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** 数值配置的合法区间，和 WebUI schema 保持一致。 */
+const CONFIG_LIMITS: Readonly<Record<string, readonly [number, number]>> = {
+  maxPerDay: [0, 96],
+  maxNudgesPerDay: [0, 96],
+  pityMisses: [0, 50],
+  idleMinMs: [0, 7_200_000],
+  idleMaxMs: [10_000, 28_800_000],
+  afterUserMessageMs: [0, 14_400_000],
+  screenshotMaxWidth: [640, 3840],
+  screenshotQuality: [40, 90],
+};
+
 /**
  * 部署里的 config.json 可能来自上一个版本：段里缺键时读到 undefined，定时器会拿到 NaN。
- * 这里只补类型不对或缺席的键，用户设的 false、0、空串都算有效值。
+ * 这里补类型不对或缺席的键，并把数值夹回 schema 允许的范围；用户设的 false、0 都算有效值。
  */
 function applyDefaults(cfg: AutoInteractConfigSection): void {
   const target = cfg as unknown as Record<string, unknown>;
+  const defaults = AUTO_INTERACT_DEFAULTS as unknown as Record<string, unknown>;
   for (const [key, fallback] of Object.entries(AUTO_INTERACT_DEFAULTS)) {
     const value = target[key];
     const valid = typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
     if (!valid) target[key] = fallback;
+  }
+
+  // 频率是字符串枚举；空串、未知档位都回到默认档，而不是被读成 1 档。
+  if (typeof target.frequency !== 'string' || !/^(?:[1-9]|10)$/.test(target.frequency)) {
+    target.frequency = defaults.frequency;
+  }
+
+  for (const [key, [min, max]] of Object.entries(CONFIG_LIMITS)) {
+    const value = target[key];
+    target[key] = typeof value === 'number' && Number.isFinite(value)
+      ? clamp(Math.round(value), min, max)
+      : defaults[key];
+  }
+
+  // 最长时间比最短时间还短时，按最短时间处理，避免「永远不算空闲」。
+  if (
+    typeof target.idleMinMs === 'number'
+    && typeof target.idleMaxMs === 'number'
+    && target.idleMinMs > 0
+    && target.idleMaxMs < target.idleMinMs
+  ) {
+    target.idleMaxMs = target.idleMinMs;
   }
 }
 
@@ -218,6 +265,10 @@ export class AutoInteractWorld implements World {
   private host: WorldHost | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
+  /** 每次 start/stop 递增，用来忽略上一轮还在 await 的 tick/start。 */
+  private startGeneration = 0;
+  /** 只用来取消正在跑的 PowerShell 探针；World 停止时 abort。 */
+  private probeAbort: AbortController | null = null;
   private nextAtMs: number | null = null;
   private dayKey = '';
   private warnedHours = false;
@@ -253,7 +304,18 @@ export class AutoInteractWorld implements World {
     this.random = opts.random ?? Math.random;
     this.clock = opts.clock ?? (() => Date.now());
     this.recordsFile = opts.dataDir ? recordsPath(opts.dataDir) : null;
-    if (this.recordsFile) this.records.push(...loadRecords(this.recordsFile));
+    if (this.recordsFile) {
+      this.records.push(...loadRecords(this.recordsFile));
+      // 上一次进程在邀约进行中退出：这轮已经不可能再结束了，别让它永远停在「还没回应」。
+      let interrupted = false;
+      for (const record of this.records) {
+        if (record.kind === 'nudge' && record.outcome === 'pending') {
+          record.outcome = 'interrupted';
+          interrupted = true;
+        }
+      }
+      if (interrupted) this.persist();
+    }
   }
 
   /** 只报值；模板正文在 ENV_PROMPT.md，玩电脑与调速那两段由配置决定。 */
@@ -285,12 +347,12 @@ export class AutoInteractWorld implements World {
   webUi(language: Language = 'zh'): WorldWebUiDecl {
     const zh = language === 'zh';
     return {
-      label: zh ? '自动互动' : 'Auto Interact',
+      label: zh ? '主动互动' : 'Auto Interact',
       config: [AUTO_INTERACT_CONFIG_GROUP],
       promptDocs: [
         {
           key: `worlds.${WORLD_ID}.envPrompt`,
-          title: zh ? '自动互动 · 环境提示词' : 'Auto Interact · Environment prompt',
+          title: zh ? '主动互动 · 环境提示词' : 'Auto Interact · Environment prompt',
           description: zh
             ? '主动互动写进 system 前缀的那一段。'
             : 'The section this World adds to the system prefix.',
@@ -352,33 +414,54 @@ export class AutoInteractWorld implements World {
   }
 
   async start(host: WorldHost): Promise<void> {
+    // 重复 start 不应排两个定时器；换宿主时先把上一轮停干净。
+    if (this.host === host && !this.stopped) return;
+    if (!this.stopped) await this.stop();
+
+    const generation = ++this.startGeneration;
     this.host = host;
     this.stopped = false;
+    this.probeAbort = new AbortController();
     const nowMs = this.clock();
     this.rollDay(localParts(nowMs, this.timezone).dayKey);
-    this.state.lastUserMessageAtMs = this.findLastUserMessageAt(host, nowMs);
-    await host.pushEvent(
-      {
-        type: `${WORLD_ID}.started`,
-        ts: nowIso(this.timezone),
-        source: WORLD_ID,
-        origin: 'internal',
-        senderKey: WORLD_ID,
-        text: `主动互动已挂载：${rhythmText(this.cfg)}`,
-      },
-      { deliver: false },
-    );
-    if (this.stopped) return;
+    // 和定时判断用同一段等待窗口；0 表示这项关掉，挂载时也不查事件库。
+    this.state.lastUserMessageAtMs = this.cfg.afterUserMessageMs > 0
+      ? this.findLastUserMessageAt(host, nowMs, this.cfg.afterUserMessageMs)
+      : null;
+    try {
+      await host.pushEvent(
+        {
+          type: `${WORLD_ID}.started`,
+          ts: nowIso(this.timezone),
+          source: WORLD_ID,
+          origin: 'internal',
+          senderKey: WORLD_ID,
+          text: `主动互动已挂载：${rhythmText(this.cfg)}`,
+        },
+        { deliver: false },
+      );
+    } catch (error) {
+      if (generation === this.startGeneration) {
+        this.stopped = true;
+        this.host = null;
+        this.probeAbort = null;
+      }
+      throw error;
+    }
+    if (this.stopped || generation !== this.startGeneration) return;
     this.schedule();
   }
 
   async stop(): Promise<void> {
+    this.startGeneration += 1;
     this.stopped = true;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     this.nextAtMs = null;
+    this.probeAbort?.abort();
+    this.probeAbort = null;
     this.host = null;
   }
 
@@ -440,7 +523,12 @@ export class AutoInteractWorld implements World {
 
   /** 当前生效的命中概率：档位概率乘上还没过期的调速倍率。 */
   private probability(nowMs: number): number {
-    const factor = nowMs < this.paceUntilMs ? this.paceFactor : 1;
+    // 模型调速被关掉时，已经设置的倍率立即失效并复位，避免重新打开时旧状态复活。
+    if (!this.cfg.allowModelAdjust) {
+      this.paceFactor = 1;
+      this.paceUntilMs = 0;
+    }
+    const factor = this.cfg.allowModelAdjust && nowMs < this.paceUntilMs ? this.paceFactor : 1;
     return pacedProbability(this.cfg.frequency, factor);
   }
 
@@ -459,23 +547,50 @@ export class AutoInteractWorld implements World {
     this.timer = null;
     if (this.stopped || !this.host) return;
     const host = this.host;
+    const generation = this.startGeneration;
     try {
       if (!this.cfg.enabled) return;
       const nowMs = this.clock();
       const zoned = localParts(nowMs, this.timezone);
       this.rollDay(zoned.dayKey);
+
+      // 先用纯内存条件挡掉最常见的情况：安静期、时段外、上限、用户刚说过话。
+      // 被挡住时不必起 PowerShell，也不必扫 24 小时的事件库。
+      const hours = this.readActiveHours();
+      const gate = checkStaticGates(this.rhythm(), { nowMs, zoned, state: this.state }, hours);
+      if (!gate.allowed) {
+        host.log.debug(`这一轮不搭话：${gate.reason}`);
+        this.remember({ atMs: nowMs, kind: 'skip', reason: gate.reason });
+        return;
+      }
+
+      // 只回看「用户说话后等待」这么长的一段；0 表示这项关掉，连查都不用查。
+      const windowMs = this.cfg.afterUserMessageMs;
+      this.state.lastUserMessageAtMs = windowMs > 0
+        ? this.findLastUserMessageAt(host, nowMs, windowMs)
+        : null;
+      if (
+        windowMs > 0
+        && this.state.lastUserMessageAtMs !== null
+        && nowMs - this.state.lastUserMessageAtMs < windowMs
+      ) {
+        host.log.debug('这一轮不搭话：user-speaking');
+        this.remember({ atMs: nowMs, kind: 'skip', reason: 'user-speaking' });
+        return;
+      }
+
       // 最短空闲为 0：不看空闲状态，也就不用起 PowerShell 去读。
       let idleMs: number | null = null;
       if (this.cfg.idleMinMs > 0) {
-        const idle = await this.probe.idleMs();
-        if (this.stopped) return;
+        const idle = await this.probe.idleMs(this.probeAbort?.signal);
+        if (this.stopped || generation !== this.startGeneration) return;
         if (!idle.ok) {
           host.log.warn('读取空闲时长失败，这一轮不搭话', { error: idle.error });
           return;
         }
         idleMs = idle.value;
       }
-      this.state.lastUserMessageAtMs = this.findLastUserMessageAt(host, nowMs);
+
       const decision = checkNudge(this.rhythm(), { nowMs, zoned, idleMs: idleMs ?? 0, state: this.state });
       if (!decision.allowed) {
         host.log.debug(`这一轮不搭话：${decision.reason}`);
@@ -497,13 +612,15 @@ export class AutoInteractWorld implements World {
       this.misses = 0;
 
       await this.pushNudge(host, nowMs, idleMs, chance.forced);
+      if (this.stopped || generation !== this.startGeneration) return;
       this.remember({ atMs: nowMs, kind: 'nudge', outcome: 'pending', ...(chance.forced ? { pity: true } : {}) });
       this.state.lastNudgeAtMs = nowMs;
       this.state.todayNudges += 1;
     } catch (error) {
       host.log.error('主动互动的定时判断出错', error);
     } finally {
-      this.schedule();
+      // stop()/新的 start() 已经接管时，不要再用旧定时器排下一轮。
+      if (generation === this.startGeneration) this.schedule();
     }
   }
 
@@ -542,7 +659,10 @@ export class AutoInteractWorld implements World {
   }
 
   private async statusTool(): Promise<ToolOutcome> {
-    const result = await this.probe.status({ includeWindowTitle: this.cfg.shareWindowTitle });
+    const result = await this.probe.status(
+      { includeWindowTitle: this.cfg.shareWindowTitle },
+      this.probeAbort?.signal,
+    );
     if (!result.ok) return { text: `读取系统状态失败：${result.error}`, failed: true };
     const status = result.value;
     const lines = [
@@ -570,7 +690,25 @@ export class AutoInteractWorld implements World {
         failed: true,
       };
     }
-    const shot = await this.probe.capture({ maxWidth: cfg.screenshotMaxWidth, quality: cfg.screenshotQuality });
+
+    // 先看模型端点收不收图：不收就别白截一张、白编码一次 JPEG。
+    let accepts = false;
+    try {
+      accepts = this.host?.modelFacts.accepts('image/jpeg') ?? false;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.noteTool('auto_look', '没看屏幕（无法判断模型是否收图）');
+      return { text: `无法判断当前模型端点是否支持图片：${message}`, failed: true };
+    }
+    if (!accepts) {
+      this.noteTool('auto_look', '没看屏幕（当前模型不收图）');
+      return { text: '当前模型端点不接受图片，未截图；这里只有文字。' };
+    }
+
+    const shot = await this.probe.capture(
+      { maxWidth: cfg.screenshotMaxWidth, quality: cfg.screenshotQuality },
+      this.probeAbort?.signal,
+    );
     if (!shot.ok) {
       this.noteTool('auto_look', '没看屏幕（截图失败）');
       return { text: `截图失败：${shot.error}`, failed: true };
@@ -578,11 +716,6 @@ export class AutoInteractWorld implements World {
     const value = shot.value;
     const head = `截屏 ${value.width}×${value.height}，原图 ${value.sourceWidth}×${value.sourceHeight}，`
       + `${Math.max(1, Math.round(value.bytes.byteLength / 1024))} KB。`;
-    const accepts = this.host?.modelFacts.accepts('image/jpeg') ?? false;
-    if (!accepts) {
-      this.noteTool('auto_look', '截了图，但当前模型不收图');
-      return { text: `${head}\n当前模型端点不接受图片，只有这段文字。` };
-    }
     this.noteTool('auto_look', '看了屏幕');
     return {
       text: head,
@@ -601,10 +734,11 @@ export class AutoInteractWorld implements World {
     const lines: string[] = [];
     const level = frequencyLevel(cfg.frequency);
     const probability = this.probability(nowMs);
-    lines.push(`频率：${level} 档，命中概率 ${Math.round(probability * 100)}%，平均 ${Math.max(1, Math.round(5 / probability))} 分钟叫醒一次`);
+    const intervalMinutes = BASE_INTERVAL_MS / MINUTE_MS;
+    lines.push(`频率：${level} 档，命中概率 ${Math.round(probability * 100)}%，平均 ${Math.max(1, Math.round(intervalMinutes / probability))} 分钟叫醒一次`);
     lines.push(`连续未命中：${this.misses} 次（到 ${pityAfter(cfg.frequency, cfg.pityMisses)} 次保底）`);
-    if (nowMs < this.paceUntilMs) {
-      lines.push(`模型调速：${this.paceFactor} 倍，到 ${formatClock(this.paceUntilMs, this.timezone)} 恢复`);
+    if (cfg.allowModelAdjust && nowMs < this.paceUntilMs) {
+      lines.push(`模型调速：${formatFactor(this.paceFactor)} 倍，到 ${formatClock(this.paceUntilMs, this.timezone)} 恢复`);
     }
     if (this.nextAtMs === null) {
       lines.push('定时判断没有在跑：World 可能还没挂载。');
@@ -630,8 +764,8 @@ export class AutoInteractWorld implements World {
   }
 
   private async quietTool(args: Record<string, unknown>): Promise<string> {
-    const raw = Number(args.minutes);
-    const minutes = Number.isFinite(raw) ? clamp(Math.round(raw), 0, 240) : 30;
+    const raw = optionalNumber(args.minutes);
+    const minutes = raw === null ? 30 : clamp(Math.round(raw), 0, 240);
     const nowMs = this.clock();
     const host = this.host;
     if (minutes === 0) {
@@ -646,10 +780,13 @@ export class AutoInteractWorld implements World {
 
   /** 模型临时调速：倍率乘在命中概率上，到点自动回到 1。 */
   private async paceTool(args: Record<string, unknown>): Promise<string> {
-    const rawFactor = Number(args.factor);
-    const factor = clamp(Number.isFinite(rawFactor) ? rawFactor : 1, 0.25, 3);
-    const rawMinutes = Number(args.minutes);
-    const minutes = Number.isFinite(rawMinutes) ? clamp(Math.round(rawMinutes), 15, 240) : 90;
+    if (!this.cfg.allowModelAdjust) {
+      return '当前部署没有打开「允许模型调速」，不能调频。';
+    }
+    const rawFactor = optionalNumber(args.factor);
+    const factor = clamp(rawFactor ?? 1, 0.25, 3);
+    const rawMinutes = optionalNumber(args.minutes);
+    const minutes = rawMinutes === null ? 90 : clamp(Math.round(rawMinutes), 15, 240);
     const nowMs = this.clock();
     this.paceFactor = factor;
     this.paceUntilMs = nowMs + minutes * MINUTE_MS;
@@ -657,11 +794,12 @@ export class AutoInteractWorld implements World {
     const between = Math.max(1, Math.round(BASE_INTERVAL_MS / MINUTE_MS / probability));
     const until = formatClock(this.paceUntilMs, this.timezone);
     this.noteTool('auto_pace', `${formatFactor(factor)} 倍，约每 ${between} 分钟一次，到 ${until} 恢复`);
-    return `接下来 ${minutes} 分钟按 ${factor} 倍调速，到 ${until} 恢复；`
+    return `接下来 ${minutes} 分钟按 ${formatFactor(factor)} 倍调速，到 ${until} 恢复；`
       + `命中概率现在 ${Math.round(probability * 100)}%，平均 ${between} 分钟叫醒一次。`;
   }
 
-  private async pushQuietEvent(host: WorldHost, untilMs: number | null): Promise<void> {    const text = untilMs === null
+  private async pushQuietEvent(host: WorldHost, untilMs: number | null): Promise<void> {
+    const text = untilMs === null
       ? '主动互动：安静期已取消。'
       : `主动互动：安静到 ${formatClock(untilMs, this.timezone)}。`;
     await host.pushEvent(
@@ -677,10 +815,15 @@ export class AutoInteractWorld implements World {
     );
   }
 
-  /** 事件库里最近一条用户发言；只看 24 小时内，类型由 `latestUserEventAt` 判定。 */
-  private findLastUserMessageAt(host: WorldHost, nowMs: number): number | null {
+  /** 事件库里最近一条用户发言；只看调用方给的窗口，类型由 `latestUserEventAt` 判定。 */
+  private findLastUserMessageAt(
+    host: WorldHost,
+    nowMs: number,
+    windowMs = 24 * 60 * MINUTE_MS,
+  ): number | null {
+    if (!Number.isFinite(windowMs) || windowMs <= 0) return null;
     try {
-      const since = new Date(nowMs - 24 * 60 * MINUTE_MS).toISOString();
+      const since = new Date(nowMs - windowMs).toISOString();
       let latest: number | null = null;
       // 分来源查，免得桌宠或别的 World 的高频事件把真正的发言挤出最近 200 条。
       for (const source of USER_SPEECH_SOURCES) {
@@ -715,8 +858,20 @@ export class AutoInteractWorld implements World {
     // 每 5 分钟一次判断，同一个跳过原因连着来只留第一条，别把日志刷满。
     if (record.kind === 'skip' && last?.kind === 'skip' && last.reason === record.reason) return;
     this.records.push(record);
-    if (this.records.length > MAX_RECORDS) this.records.splice(0, this.records.length - MAX_RECORDS);
+    this.trimRecords();
     this.persist();
+  }
+
+  /** 超过上限时先删最旧的跳过/已结束记录，尽量保住还在等回应的邀约。 */
+  private trimRecords(): void {
+    while (this.records.length > MAX_RECORDS) {
+      const removable = this.records.findIndex((record) => record.kind === 'skip' || record.outcome !== 'pending');
+      if (removable < 0) {
+        this.records.shift();
+        continue;
+      }
+      this.records.splice(removable, 1);
+    }
   }
 
   /** 记下这一轮某个工具的补充说明；不在邀约轮次里就不记。 */
@@ -751,10 +906,14 @@ export class AutoInteractWorld implements World {
     }
   }
 
-  /** 每次变化都整份重写；记录最多 60 条，几 KB。 */
+  /** 每次变化都整份重写；记录最多 60 条，几 KB。写盘失败只警告，不影响这一轮判断。 */
   private persist(): void {
     if (!this.recordsFile) return;
-    saveRecords(this.recordsFile, this.records);
+    try {
+      saveRecords(this.recordsFile, this.records);
+    } catch (error) {
+      this.host?.log.warn('保存互动记录失败，这次改动只留在内存里', { error });
+    }
   }
 
   /** 给面板的视图：新的在前；detail 记这一轮做了什么、花了多久。 */

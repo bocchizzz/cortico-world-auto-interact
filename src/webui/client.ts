@@ -41,7 +41,7 @@ const GUIDE_ZH: GuideSection[] = [
       '主动搭话：判定命中，把模型叫醒。保底叫醒：连续未命中，按保底叫的。',
       '开口了 / 没开口：这一轮有没有调 pet_say 或 pet_ask。',
       '下面的小字是这一轮做了什么：看了屏幕、看了状态、问了你，以及花了多久。',
-      '还没回应 / 被清掉了：这一轮还没结束，或者事件被你在队列里清空了。',
+      '还没回应 / 被清掉了 / 中断了（重启）：这一轮还没结束、事件被你在队列里清空了，或者上次进程在邀约中途退出。',
       '跳过：安静期、不在时段、上限用满、你正在用电脑、你离开太久等。连续相同的原因只记一条。',
     ],
   },
@@ -73,7 +73,8 @@ const GUIDE_EN: GuideSection[] = [
       'Frequency: 1–10, the hit chance; about one wake-up per 100 to 5 minutes.',
       'Daily speaks: counts only real speech (pet_say or pet_ask).',
       'Daily wake-ups: every hit counts, silent or not.',
-      'Force after silence: after N turns where the model ignored the wake-up, the next event spells the demand out.',      'Model pacing: lets the pet call auto_pace to scale the rate for a while.',
+      'Force after silence: after N turns where the model ignored the wake-up, the next event spells the demand out.',
+      'Model pacing: lets the pet call auto_pace to scale the rate for a while.',
     ],
   },
   {
@@ -82,7 +83,7 @@ const GUIDE_EN: GuideSection[] = [
       'Scheduled / pity: why the model was woken.',
       'Spoke / silent: whether pet_say or pet_ask was called in that turn.',
       'The small line shows what that turn did: looked at the screen, checked status, asked you, and how long it took.',
-      'Pending / dropped: turn still running, or you cleared the queued event.',
+      'Pending / dropped / interrupted: turn still running, you cleared the queued event, or the previous process exited mid-turn.',
       'Skipped: quiet hours, outside hours, daily caps, you were active or away. Repeated reasons are collapsed.',
     ],
   },
@@ -98,6 +99,43 @@ interface RecordRow {
 
 interface RecordsPayload {
   records: RecordRow[];
+}
+
+/** 记录面板的界面文案；面板本身支持中文和英文，不能把中文写死在 DOM 里。 */
+interface RecordsCopy {
+  title: string;
+  refresh: string;
+  clear: string;
+  confirm: string;
+  empty: string;
+  readFailed: (message: string) => string;
+  clearFailed: (message: string) => string;
+}
+
+const RECORDS_COPY: Record<'zh' | 'en', RecordsCopy> = {
+  zh: {
+    title: '最近的记录',
+    refresh: '刷新',
+    clear: '清除',
+    confirm: '清除全部互动记录？这会同时删掉磁盘上的记录文件。',
+    empty: '还没有记录：等下一次判定命中。',
+    readFailed: (message) => `读取失败：${message}`,
+    clearFailed: (message) => `清除失败：${message}`,
+  },
+  en: {
+    title: 'Recent log',
+    refresh: 'Refresh',
+    clear: 'Clear',
+    confirm: 'Clear all interaction records? This also deletes the record file on disk.',
+    empty: 'No records yet. Wait for the next hit.',
+    readFailed: (message) => `Could not load: ${message}`,
+    clearFailed: (message) => `Could not clear: ${message}`,
+  },
+};
+
+/** `zh`、`zh-Hant` 都走中文；其余语言走英文。 */
+function uiLanguage(language: string): 'zh' | 'en' {
+  return language.toLowerCase().startsWith('zh') ? 'zh' : 'en';
 }
 
 function row(doc: Document, record: RecordRow): HTMLElement {
@@ -138,20 +176,28 @@ function button(doc: Document, label: string, onClick: () => void): HTMLButtonEl
   return el;
 }
 
-async function load(ctx: WebUiPanelContext, list: HTMLElement, note: HTMLElement): Promise<void> {
+async function load(
+  ctx: WebUiPanelContext,
+  list: HTMLElement,
+  note: HTMLElement,
+  copy: RecordsCopy,
+  isCurrent: () => boolean,
+): Promise<void> {
   try {
     const payload = await ctx.invoke<RecordsPayload>('list');
+    if (!isCurrent()) return;
     const records = payload?.records ?? [];
     list.replaceChildren(...records.map((record) => row(ctx.root.ownerDocument, record)));
-    note.textContent = records.length ? '' : '还没有记录：等下一次判定命中。';
+    note.textContent = records.length ? '' : copy.empty;
   } catch (error) {
-    note.textContent = `读取失败：${error instanceof Error ? error.message : String(error)}`;
+    if (!isCurrent()) return;
+    note.textContent = copy.readFailed(error instanceof Error ? error.message : String(error));
   }
 }
 
 function mountGuide(ctx: WebUiPanelContext): void {
   const doc = ctx.root.ownerDocument;
-  const zh = ctx.language === 'zh';
+  const zh = uiLanguage(ctx.language) === 'zh';
   const wrap = doc.createElement('div');
   wrap.className = 'ai-guide';
 
@@ -175,6 +221,7 @@ function mountGuide(ctx: WebUiPanelContext): void {
 
 function mountRecords(ctx: WebUiPanelContext): void {
   const doc = ctx.root.ownerDocument;
+  const copy = RECORDS_COPY[uiLanguage(ctx.language)];
   const wrap = doc.createElement('div');
   wrap.className = 'ai-records';
 
@@ -182,7 +229,7 @@ function mountRecords(ctx: WebUiPanelContext): void {
   bar.className = 'ai-records__bar';
   const title = doc.createElement('span');
   title.className = 'ai-records__title';
-  title.textContent = '最近的记录';
+  title.textContent = copy.title;
   const actions = doc.createElement('span');
   actions.className = 'ai-records__actions';
 
@@ -192,19 +239,22 @@ function mountRecords(ctx: WebUiPanelContext): void {
   const list = doc.createElement('div');
   list.className = 'ai-records__list';
 
+  // 定时刷新和手动刷新可能同时在跑；只让最后一次请求落地，避免旧结果覆盖新结果。
+  let requestId = 0;
   const reload = (): void => {
-    void load(ctx, list, note);
+    const current = ++requestId;
+    void load(ctx, list, note, copy, () => current === requestId);
   };
 
   actions.append(
-    button(doc, '刷新', reload),
-    button(doc, '清除', () => {
-      const ok = doc.defaultView?.confirm('清除全部互动记录？这会同时删掉磁盘上的记录文件。') ?? true;
+    button(doc, copy.refresh, reload),
+    button(doc, copy.clear, () => {
+      const ok = doc.defaultView?.confirm(copy.confirm) ?? true;
       if (!ok) return;
       void ctx.invoke<RecordsPayload>('clear')
         .then(() => reload())
         .catch((error: unknown) => {
-          note.textContent = `清除失败：${error instanceof Error ? error.message : String(error)}`;
+          note.textContent = copy.clearFailed(error instanceof Error ? error.message : String(error));
         });
     }),
   );

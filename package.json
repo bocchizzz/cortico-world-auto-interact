@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-auto-interact",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Cortico World: probability-checked check-ins that let the desktop pet speak up with screen and system context",
   "license": "MIT",
@@ -28,7 +28,7 @@
   "cortico": {
     "kind": "world",
     "api": 6,
-    "displayName": "自动互动",
+    "displayName": "主动互动",
     "icon": "icon.png",
     "tags": [
       "companion",
@@ -39,7 +39,7 @@
     "webUiStyle": "dist/webui.css",
     "locales": {
       "zh": {
-        "displayName": "自动互动",
+        "displayName": "主动互动",
         "description": "按设定频率把 Coo 叫醒，看一眼屏幕再开口；没命中就不打扰。"
       },
       "en": {

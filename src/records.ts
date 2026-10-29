@@ -2,7 +2,7 @@
 import type { NudgeBlockReason } from './scheduler.ts';
 
 /** 一条邀约的下场。 */
-export type InteractionOutcome = 'pending' | 'spoke' | 'silent' | 'dropped';
+export type InteractionOutcome = 'pending' | 'spoke' | 'silent' | 'dropped' | 'interrupted';
 
 export interface InteractionRecord {
   atMs: number;
@@ -38,7 +38,7 @@ export function isBlockReason(value: unknown): value is NudgeBlockReason {
   return typeof value === 'string' && (BLOCK_REASONS as readonly string[]).includes(value);
 }
 
-const OUTCOMES: readonly InteractionOutcome[] = ['pending', 'spoke', 'silent', 'dropped'];
+const OUTCOMES: readonly InteractionOutcome[] = ['pending', 'spoke', 'silent', 'dropped', 'interrupted'];
 
 export function isOutcome(value: unknown): value is InteractionOutcome {
   return typeof value === 'string' && (OUTCOMES as readonly string[]).includes(value);
@@ -59,6 +59,7 @@ const OUTCOME_LABELS: Record<InteractionOutcome, string> = {
   spoke: '开口了',
   silent: '没开口',
   dropped: '被清掉了',
+  interrupted: '中断了（重启）',
 };
 
 export function skipLabel(reason: NudgeBlockReason): string {

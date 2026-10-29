@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -87,12 +87,42 @@ describe('构造与声明', () => {
     expect(legacy.note).toBe('');
   });
 
+  it('配置越界时夹回合法范围', () => {
+    const ctx = fakeWorldContext(AUTO_INTERACT, { scratchDir });
+    Object.assign(ctx.cfg, {
+      maxPerDay: -4,
+      maxNudgesPerDay: -1,
+      afterUserMessageMs: -1,
+      idleMinMs: 5_000_000,
+      idleMaxMs: 1_000,
+      screenshotQuality: 999,
+      frequency: '',
+    });
+    new AutoInteractWorld({ cfg: ctx.cfg, timezone: TZ, probe: fakeProbe(), clock: () => Date.now() });
+    expect(ctx.cfg.maxPerDay).toBe(0);
+    expect(ctx.cfg.maxNudgesPerDay).toBe(0);
+    expect(ctx.cfg.afterUserMessageMs).toBe(0);
+    expect(ctx.cfg.idleMinMs).toBe(5_000_000);
+    expect(ctx.cfg.idleMaxMs).toBe(5_000_000);
+    expect(ctx.cfg.screenshotQuality).toBe(90);
+    expect(ctx.cfg.frequency).toBe('5');
+  });
+
   it('挂载时记一条 started，不唤醒模型', async () => {
     const { world, host } = setup();
     await world.start(host);
     const started = host.events.find((e) => e.type === `${WORLD_ID}.started`);
     expect(started?.origin).toBe('internal');
     expect(host.pushOpts[0]).toEqual({ deliver: false });
+    await world.stop();
+  });
+  it('重复 start 不会排两个定时器', async () => {
+    const { world, host } = setup();
+    await world.start(host);
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(host.events.filter((e) => e.type === `${WORLD_ID}.started`)).toHaveLength(1);
+    expect(nudges(host)).toHaveLength(1);
     await world.stop();
   });
 });
@@ -145,6 +175,25 @@ describe('定时判断', () => {
     expect(nudge.text).toContain('现在是 10:05。');
     expect(nudge.text).not.toContain('没有操作电脑');
     expect(probe.calls.idle).toBe(0);
+    await world.stop();
+  });
+
+  it('纯内存条件挡住时不读探针也不查事件库', async () => {
+    const { world, host, probe } = setup({ maxPerDay: 0 });
+    await world.start(host);
+    const range = vi.spyOn(host.store, 'range');
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(probe.calls.idle).toBe(0);
+    expect(range).not.toHaveBeenCalled();
+    await world.stop();
+  });
+
+  it('等待窗口为 0 时启动和定时都不查事件库', async () => {
+    const { world, host } = setup({ afterUserMessageMs: 0 });
+    const range = vi.spyOn(host.store, 'range');
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(range).not.toHaveBeenCalled();
     await world.stop();
   });
 
@@ -304,6 +353,20 @@ describe('安静期', () => {
     expect(nudges(host)).toHaveLength(1);
     await world.stop();
   });
+
+  it('null 参数当作没给，不会变成 0', async () => {
+    const { world, host } = setup({ allowModelAdjust: true });
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    world.onEventsSettled([nudges(host)[0]], 'delivered');
+
+    const quiet = await runTool(world, 'auto_quiet', { minutes: null });
+    expect(quiet.text).toContain('30 分钟');
+    const pace = await runTool(world, 'auto_pace', { factor: null, minutes: null });
+    expect(pace.text).toContain('按 1 倍调速');
+    expect(pace.text).toContain('90 分钟');
+    await world.stop();
+  });
 });
 
 describe('看屏幕', () => {
@@ -330,11 +393,13 @@ describe('看屏幕', () => {
   });
 
   it('模型不收图时只回文字', async () => {
-    const { world, host } = setup({ allowScreenshot: true });
+    const { world, host, probe } = setup({ allowScreenshot: true });
     await world.start(host);
     const outcome = await runTool(world, 'auto_look');
     expect(outcome.blobs).toBeUndefined();
     expect(outcome.text).toContain('不接受图片');
+    expect(probe.calls.capture).toBe(0);
+    await world.stop();
   });
 });
 
@@ -376,6 +441,18 @@ describe('环境提示词', () => {
     cfg.allowComputerPlay = true;
     expect(world.envPromptVars()['auto.rhythm']).toContain('65%');
     expect(world.envPromptVars()['auto.play']).toContain('pet_ask');
+  });
+
+  it('idleMin 为 0 时不再写「空闲 1 秒」', () => {
+    const { world } = setup({ idleMinMs: 0 });
+    const rhythm = world.envPromptVars()['auto.rhythm'];
+    expect(rhythm).toContain('不检查用户空闲');
+    expect(rhythm).not.toContain('1 秒');
+  });
+
+  it('中文面板名改成主动互动', () => {
+    const { world } = setup();
+    expect(world.webUi('zh').label).toBe('主动互动');
   });
 });
 
@@ -502,6 +579,7 @@ describe('互动记录', () => {
       { capture: { ok: false, error: '访问被拒绝' } },
     );
     await world.start(host);
+    host.acceptsImage = true;
     await vi.advanceTimersByTimeAsync(5 * MINUTE);
     world.onEventsSettled([nudges(host)[0]], 'delivered');
 
@@ -534,6 +612,22 @@ describe('互动记录', () => {
     expect(rows[0].detail).toContain('调了频率：0.5 倍');
     expect(rows[0].detail).toContain('约每 10 分钟一次');
     expect(rows[0].detail).toContain('到 10:35 恢复');
+    await world.stop();
+  });
+
+  it('关闭调速后旧倍率立即失效', async () => {
+    const { world, host, cfg } = setup({ allowModelAdjust: true, frequency: '7' }, {}, () => 0.4);
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    world.onEventsSettled([nudges(host)[0]], 'delivered');
+    await runTool(world, 'auto_pace', { factor: 0.5, minutes: 30 });
+
+    const paced = await runTool(world, 'auto_plan');
+    expect(paced.text).toContain('模型调速：0.5 倍');
+    cfg.allowModelAdjust = false;
+    const restored = await runTool(world, 'auto_plan');
+    expect(restored.text).not.toContain('模型调速');
+    expect(restored.text).toContain('命中概率 50%');
     await world.stop();
   });
 
@@ -573,6 +667,41 @@ describe('互动记录', () => {
     const { records: rows } = await records(second.world);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ text: '跳过：今天开口次数用满' });
+  });
+
+  it('重启后遗留的「还没回应」标成中断了', async () => {
+    const first = setup();
+    await first.world.start(first.host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    first.world.onEventsSettled([nudges(first.host)[0]], 'delivered');
+    await first.world.stop();
+
+    const second = setup();
+    const { records: rows } = await records(second.world);
+    expect(rows[0]).toMatchObject({ outcome: '中断了（重启）' });
+  });
+
+  it('记录写盘失败只警告，不打断这一轮', async () => {
+    const broken = join(scratchDir, 'not-a-dir');
+    writeFileSync(broken, 'x');
+    const ctx = fakeWorldContext(AUTO_INTERACT, { scratchDir });
+    Object.assign(ctx.cfg, { enabled: true, frequency: '10' });
+    const host = new FakeHost();
+    const warn = vi.spyOn(host.log, 'warn');
+    const world = new AutoInteractWorld({
+      cfg: ctx.cfg,
+      timezone: TZ,
+      dataDir: broken,
+      probe: fakeProbe(),
+      random: () => 0.5,
+      clock: () => Date.now(),
+    });
+    await world.start(host);
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+
+    expect(nudges(host)).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith('保存互动记录失败，这次改动只留在内存里', expect.anything());
+    await world.stop();
   });
 
   it('记录页能清掉记录和文件', async () => {
